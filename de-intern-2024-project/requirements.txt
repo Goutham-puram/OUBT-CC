@@ -14,6 +14,8 @@ sqlalchemy>=2.0.0
 alembic>=1.13.0
 
 # AWS Glue / PySpark (for local development)
+# Note: awsglue libraries are only available in AWS Glue environment
+# For local development and testing, use pyspark
 pyspark>=3.5.0
 
 # Data Validation

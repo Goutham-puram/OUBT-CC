@@ -1,0 +1,18 @@
+# Demo Scripts Requirements
+# Install with: pip install -r requirements.txt
+
+# AWS SDK for Python
+boto3>=1.28.0
+
+# Data manipulation
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Parquet file handling
+pyarrow>=12.0.0
+
+# Type hints
+typing-extensions>=4.5.0
+
+# Optional: Progress bars
+tqdm>=4.65.0

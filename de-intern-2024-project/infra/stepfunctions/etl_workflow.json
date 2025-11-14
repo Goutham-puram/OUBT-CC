@@ -1,0 +1,357 @@
+{
+  "Comment": "ETL Pipeline Orchestration Workflow for NYC Taxi Data Processing",
+  "StartAt": "ValidateInput",
+  "TimeoutSeconds": 7200,
+  "States": {
+    "ValidateInput": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Validate S3 event data and extract metadata",
+      "Parameters": {
+        "FunctionName": "etl-orchestrator-validate-input",
+        "Payload": {
+          "bucket.$": "$.bucket",
+          "key.$": "$.key",
+          "size.$": "$.size",
+          "eventTime.$": "$.eventTime"
+        }
+      },
+      "ResultPath": "$.validationResult",
+      "ResultSelector": {
+        "isValid.$": "$.Payload.isValid",
+        "metadata.$": "$.Payload.metadata",
+        "message.$": "$.Payload.message"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckValidation"
+    },
+
+    "CheckValidation": {
+      "Type": "Choice",
+      "Comment": "Check if input validation passed",
+      "Choices": [
+        {
+          "Variable": "$.validationResult.isValid",
+          "BooleanEquals": true,
+          "Next": "RunGlueETLJob"
+        }
+      ],
+      "Default": "NotifyValidationFailure"
+    },
+
+    "NotifyValidationFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Comment": "Send notification for validation failure",
+      "Parameters": {
+        "TopicArn": "${SNSTopicArn}",
+        "Subject": "ETL Pipeline - Validation Failed",
+        "Message": {
+          "status": "VALIDATION_FAILED",
+          "message.$": "$.validationResult.message",
+          "bucket.$": "$.bucket",
+          "key.$": "$.key",
+          "timestamp.$": "$$.State.EnteredTime"
+        }
+      },
+      "End": true
+    },
+
+    "RunGlueETLJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Comment": "Start Glue ETL job and wait for completion",
+      "Parameters": {
+        "JobName": "job-process-taxi-data",
+        "Arguments": {
+          "--bucket_name.$": "$.bucket",
+          "--source_key.$": "$.key",
+          "--source_prefix": "raw/taxi/",
+          "--target_prefix": "processed/taxi/",
+          "--job-bookmark-option": "job-bookmark-enable"
+        }
+      },
+      "ResultPath": "$.glueJobResult",
+      "ResultSelector": {
+        "JobRunId.$": "$.Id",
+        "JobRunState.$": "$.JobRunState",
+        "ExecutionTime.$": "$.ExecutionTime",
+        "StartedOn.$": "$.StartedOn",
+        "CompletedOn.$": "$.CompletedOn"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 5,
+          "BackoffRate": 1.5,
+          "Comment": "Retry if max concurrent runs exceeded"
+        },
+        {
+          "ErrorEquals": [
+            "Glue.InternalServiceException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Retry transient Glue failures"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyGlueJobFailure"
+        }
+      ],
+      "Next": "CheckGlueJobStatus"
+    },
+
+    "CheckGlueJobStatus": {
+      "Type": "Choice",
+      "Comment": "Check Glue job execution status",
+      "Choices": [
+        {
+          "Variable": "$.glueJobResult.JobRunState",
+          "StringEquals": "SUCCEEDED",
+          "Next": "RunCrawlerUpdate"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.glueJobResult.JobRunState",
+              "StringEquals": "FAILED"
+            },
+            {
+              "Variable": "$.glueJobResult.JobRunState",
+              "StringEquals": "TIMEOUT"
+            },
+            {
+              "Variable": "$.glueJobResult.JobRunState",
+              "StringEquals": "STOPPED"
+            }
+          ],
+          "Next": "NotifyGlueJobFailure"
+        }
+      ],
+      "Default": "NotifyGlueJobFailure"
+    },
+
+    "NotifyGlueJobFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Comment": "Send notification for Glue job failure",
+      "Parameters": {
+        "TopicArn": "${SNSTopicArn}",
+        "Subject": "ETL Pipeline - Glue Job Failed",
+        "Message": {
+          "status": "GLUE_JOB_FAILED",
+          "jobName": "job-process-taxi-data",
+          "jobRunId.$": "$.glueJobResult.JobRunId",
+          "jobRunState.$": "$.glueJobResult.JobRunState",
+          "bucket.$": "$.bucket",
+          "key.$": "$.key",
+          "error.$": "$.error",
+          "timestamp.$": "$$.State.EnteredTime"
+        }
+      },
+      "Next": "NotifyFailure"
+    },
+
+    "RunCrawlerUpdate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Comment": "Update Glue Data Catalog by running crawler",
+      "Parameters": {
+        "Name": "crawler-taxi-raw"
+      },
+      "ResultPath": "$.crawlerResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.CrawlerRunningException"
+          ],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 1.5,
+          "Comment": "Wait if crawler is already running"
+        },
+        {
+          "ErrorEquals": [
+            "Glue.OperationTimeoutException",
+            "Glue.InternalServiceException"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Retry transient failures"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.crawlerError",
+          "Next": "HandleCrawlerFailure"
+        }
+      ],
+      "Next": "WaitForCrawler"
+    },
+
+    "WaitForCrawler": {
+      "Type": "Wait",
+      "Comment": "Wait for crawler to start and process data",
+      "Seconds": 30,
+      "Next": "CheckCrawlerStatus"
+    },
+
+    "CheckCrawlerStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "Comment": "Check crawler execution status",
+      "Parameters": {
+        "Name": "crawler-taxi-raw"
+      },
+      "ResultPath": "$.crawlerStatusResult",
+      "ResultSelector": {
+        "State.$": "$.Crawler.State",
+        "LastCrawl.$": "$.Crawler.LastCrawl"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.OperationTimeoutException",
+            "Glue.InternalServiceException"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.crawlerStatusError",
+          "Next": "HandleCrawlerFailure"
+        }
+      ],
+      "Next": "IsCrawlerRunning"
+    },
+
+    "IsCrawlerRunning": {
+      "Type": "Choice",
+      "Comment": "Check if crawler is still running",
+      "Choices": [
+        {
+          "Variable": "$.crawlerStatusResult.State",
+          "StringEquals": "RUNNING",
+          "Next": "WaitForCrawler"
+        },
+        {
+          "Variable": "$.crawlerStatusResult.State",
+          "StringEquals": "READY",
+          "Next": "NotifySuccess"
+        }
+      ],
+      "Default": "HandleCrawlerFailure"
+    },
+
+    "HandleCrawlerFailure": {
+      "Type": "Pass",
+      "Comment": "Handle crawler failure gracefully (non-critical)",
+      "Parameters": {
+        "crawlerFailed": true,
+        "message": "Crawler update failed, but Glue job succeeded. Manual catalog update may be needed."
+      },
+      "ResultPath": "$.crawlerFailureInfo",
+      "Next": "NotifyPartialSuccess"
+    },
+
+    "NotifyPartialSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Comment": "Send notification for partial success (job succeeded, crawler failed)",
+      "Parameters": {
+        "TopicArn": "${SNSTopicArn}",
+        "Subject": "ETL Pipeline - Partial Success",
+        "Message": {
+          "status": "PARTIAL_SUCCESS",
+          "message": "Glue job completed successfully, but crawler update failed",
+          "jobName": "job-process-taxi-data",
+          "jobRunId.$": "$.glueJobResult.JobRunId",
+          "executionTimeSeconds.$": "$.glueJobResult.ExecutionTime",
+          "bucket.$": "$.bucket",
+          "key.$": "$.key",
+          "crawlerError.$": "$.crawlerFailureInfo",
+          "timestamp.$": "$$.State.EnteredTime",
+          "workflowExecutionId.$": "$$.Execution.Id"
+        }
+      },
+      "End": true
+    },
+
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Comment": "Send success notification with execution details",
+      "Parameters": {
+        "TopicArn": "${SNSTopicArn}",
+        "Subject": "ETL Pipeline - Success",
+        "Message": {
+          "status": "SUCCESS",
+          "message": "ETL pipeline completed successfully",
+          "jobName": "job-process-taxi-data",
+          "jobRunId.$": "$.glueJobResult.JobRunId",
+          "executionTimeSeconds.$": "$.glueJobResult.ExecutionTime",
+          "bucket.$": "$.bucket",
+          "key.$": "$.key",
+          "crawlerState.$": "$.crawlerStatusResult.State",
+          "timestamp.$": "$$.State.EnteredTime",
+          "workflowExecutionId.$": "$$.Execution.Id"
+        }
+      },
+      "End": true
+    },
+
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Comment": "Send failure notification",
+      "Parameters": {
+        "TopicArn": "${SNSTopicArn}",
+        "Subject": "ETL Pipeline - Failed",
+        "Message": {
+          "status": "FAILED",
+          "message": "ETL pipeline execution failed",
+          "bucket.$": "$.bucket",
+          "key.$": "$.key",
+          "error.$": "$.error",
+          "timestamp.$": "$$.State.EnteredTime",
+          "workflowExecutionId.$": "$$.Execution.Id"
+        }
+      },
+      "End": true
+    }
+  }
+}
